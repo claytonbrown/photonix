@@ -54,6 +54,19 @@ const GET_PHOTO = gql`
         sizeX
         sizeY
       }
+      personTags {
+        id
+        tag {
+          name
+        }
+        positionX
+        positionY
+        sizeX
+        sizeY
+        verified
+        deleted
+        showVerifyIcon
+      }
       colorTags {
         id
         tag {
@@ -112,7 +125,7 @@ const PhotoDetailContainer = (props) => {
     const handleKeyDown = (event) => {
       switch (event.keyCode) {
         case ESCAPE_KEY:
-          history.push('/')
+          event.target.name !== 'tagName' && history.push('/')
           break
         default:
           break

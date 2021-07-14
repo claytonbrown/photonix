@@ -7,6 +7,7 @@ from django.db import models, transaction
 from django.utils import timezone
 
 from photonix.common.models import UUIDModel, VersionedModel
+from photonix.web.utils import logger
 
 
 User = get_user_model()
@@ -25,6 +26,7 @@ class Library(UUIDModel, VersionedModel):
     classification_location_enabled = models.BooleanField(default=False, help_text='Run location detection on photos?')
     classification_style_enabled = models.BooleanField(default=False, help_text='Run style classification on photos?')
     classification_object_enabled = models.BooleanField(default=False, help_text='Run object detection on photos?')
+    classification_face_enabled = models.BooleanField(default=False, help_text='Run face detection on photos?')
     setup_stage_completed = models.CharField(max_length=2, choices=LIBRARY_SETUP_STAGE_COMPLETED_CHOICES, blank=True, null=True, help_text='Where the user got to during onboarding setup')
 
     class Meta:
@@ -121,7 +123,7 @@ class Photo(UUIDModel, VersionedModel):
     exposure = models.CharField(max_length=8, blank=True, null=True)
     iso_speed = models.PositiveIntegerField(null=True)
     focal_length = models.DecimalField(max_digits=4, decimal_places=1, null=True)
-    flash = models.NullBooleanField()
+    flash = models.BooleanField(null=True)
     metering_mode = models.CharField(max_length=64, null=True)
     drive_mode = models.CharField(max_length=64, null=True)
     shooting_mode = models.CharField(max_length=64, null=True)
@@ -202,8 +204,8 @@ class PhotoFile(UUIDModel, VersionedModel):
     thumbnailed_version = models.PositiveIntegerField(default=0)  # Version from photos.utils.thumbnails.THUMBNAILER_VERSION at time of generating the required thumbnails declared in settings.THUMBNAIL_SIZES
     raw_processed = models.BooleanField(default=False)
     raw_version = models.PositiveIntegerField(null=True)
-    raw_external_params = models.CharField(max_length=16, blank=True, null=True)
-    raw_external_version = models.CharField(max_length=16, blank=True, null=True)
+    raw_external_params = models.CharField(max_length=32, blank=True, null=True)
+    raw_external_version = models.CharField(max_length=32, blank=True, null=True)
 
     def __str__(self):
         return str(self.path)
@@ -256,7 +258,8 @@ class PhotoTag(UUIDModel, VersionedModel):
     photo = models.ForeignKey(Photo, related_name='photo_tags', on_delete=models.CASCADE, null=True)
     tag = models.ForeignKey(Tag, related_name='photo_tags', on_delete=models.CASCADE)
     source = models.CharField(max_length=1, choices=SOURCE_CHOICES, db_index=True)
-    model_version = models.PositiveIntegerField(default=0)
+    model_version = models.PositiveIntegerField(default=0, help_text='Version number of classifier model if source is Computer (YYYYMMDD)')
+    retrained_model_version = models.PositiveBigIntegerField(default=0, help_text='If classifier has models that are re-trained locally (e.g. Face) then we want to store this too (YYYYMMDDHHMMSS)')
     confidence = models.FloatField()
     significance = models.FloatField(null=True)
     verified = models.BooleanField(default=False)
@@ -266,6 +269,9 @@ class PhotoTag(UUIDModel, VersionedModel):
     position_y = models.FloatField(null=True)
     size_x = models.FloatField(null=True)
     size_y = models.FloatField(null=True)
+    # A place to store extra JSON data such as face feature positions for eyes, nose and mouth
+    extra_data = models.TextField(null=True)
+    deleted = models.BooleanField(default=False)
 
     class Meta:
         ordering = ['-significance']
@@ -322,7 +328,10 @@ class Task(UUIDModel, VersionedModel):
                     self.parent.complete(
                         next_type=next_type, next_subject_id=next_subject_id)
 
-    def failed(self):
+    def failed(self, error=None, traceback=None):
         self.status = 'F'
         self.finished_at = timezone.now()
         self.save()
+
+        if error:
+            logger.error(error)
