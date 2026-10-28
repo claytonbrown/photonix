@@ -1,0 +1,178 @@
+import {
+  createContext,
+  useContext,
+  useState,
+  useEffect,
+  useCallback,
+  useMemo,
+  type ReactNode,
+} from 'react'
+import Cookies from 'js-cookie'
+import { useMutation } from '@apollo/client/react'
+import { apolloClient } from '../apollo-client'
+import { TOKEN_AUTH, REVOKE_TOKEN, DELETE_AUTH_COOKIES } from './graphql'
+import { setAccessToken, clearTokens } from './auth-store'
+import {
+  scheduleTokenRefresh,
+  cancelTokenRefresh,
+  performTokenRefresh,
+  setAuthFailureCallback,
+  setSessionActive,
+  enableVisibilityRefresh,
+  disableVisibilityRefresh,
+} from './token-refresh'
+import type { AuthContextValue, User, LoginResult } from './types'
+
+const AuthContext = createContext<AuthContextValue | null>(null)
+
+export function AuthProvider({ children }: { children: ReactNode }) {
+  const [user, setUser] = useState<User | null>(null)
+  const [isLoading, setIsLoading] = useState(true)
+  const [isAuthenticated, setIsAuthenticated] = useState(false)
+
+  const [tokenAuthMutation] = useMutation(TOKEN_AUTH)
+  const [revokeTokenMutation] = useMutation(REVOKE_TOKEN)
+  const [deleteAuthCookiesMutation] = useMutation(DELETE_AUTH_COOKIES)
+
+  useEffect(() => {
+    setAuthFailureCallback(() => {
+      setUser(null)
+      setIsAuthenticated(false)
+    })
+
+    const handleTokenExpired = () => {
+      setUser(null)
+      setIsAuthenticated(false)
+    }
+    window.addEventListener('auth:token-expired', handleTokenExpired)
+
+    return () => {
+      window.removeEventListener('auth:token-expired', handleTokenExpired)
+    }
+  }, [])
+
+  useEffect(() => {
+    async function initAuth() {
+      const existingRefreshToken = Cookies.get('refreshToken')
+
+      if (!existingRefreshToken) {
+        setIsLoading(false)
+        return
+      }
+
+      setSessionActive(true)
+      const result = await performTokenRefresh()
+
+      if (result && typeof result === 'object') {
+        setUser(result)
+        setIsAuthenticated(true)
+        enableVisibilityRefresh()
+      }
+
+      setIsLoading(false)
+    }
+
+    initAuth()
+    return () => {
+      cancelTokenRefresh()
+      disableVisibilityRefresh()
+    }
+  }, [])
+
+  const login = useCallback(
+    async (username: string, password: string): Promise<LoginResult> => {
+      try {
+        const result = await tokenAuthMutation({
+          variables: { username, password },
+        })
+
+        if (result.error) throw result.error
+
+        const data = result.data
+
+        if (data?.tokenAuth) {
+          const { token, refreshToken: newRefreshToken } = data.tokenAuth
+          const payload = JSON.parse(atob(token.split('.')[1]))
+
+          setAccessToken(token, payload.exp)
+          setSessionActive(true)
+
+          Cookies.set('refreshToken', newRefreshToken, {
+            expires: 365,
+            sameSite: 'strict',
+            secure: window.location.protocol === 'https:',
+          })
+
+          scheduleTokenRefresh()
+          enableVisibilityRefresh()
+          setUser({ username: payload.username })
+          setIsAuthenticated(true)
+
+          return { success: true }
+        }
+
+        return { success: false, error: 'Authentication failed' }
+      } catch (error) {
+        return {
+          success: false,
+          error: error instanceof Error ? error.message : 'Unknown error',
+        }
+      }
+    },
+    [tokenAuthMutation]
+  )
+
+  const logout = useCallback(async () => {
+    const currentRefreshToken = Cookies.get('refreshToken')
+    // Stop any scheduled refresh and make an in-flight one a no-op, so a
+    // rotated token can't re-establish the session we're tearing down.
+    setSessionActive(false)
+    cancelTokenRefresh()
+    disableVisibilityRefresh()
+
+    const serverCleanup: Promise<unknown>[] = []
+    if (currentRefreshToken) {
+      serverCleanup.push(
+        revokeTokenMutation({
+          variables: { refreshToken: currentRefreshToken },
+        }).catch(() => {})
+      )
+    }
+    // Clear the server-set httpOnly auth cookies that JavaScript can't remove.
+    serverCleanup.push(deleteAuthCookiesMutation().catch(() => {}))
+
+    clearTokens()
+    Cookies.remove('refreshToken')
+    setUser(null)
+    setIsAuthenticated(false)
+
+    // Drop any private data cached in memory so it can't leak to the next
+    // person who uses this browser session.
+    await Promise.allSettled(serverCleanup)
+    await apolloClient.clearStore().catch(() => {})
+  }, [revokeTokenMutation, deleteAuthCookiesMutation])
+
+  const refreshUser = useCallback(async () => {
+    const existingRefreshToken = Cookies.get('refreshToken')
+    if (!existingRefreshToken) return
+
+    const result = await performTokenRefresh()
+    if (result && typeof result === 'object') {
+      setUser(result)
+      setIsAuthenticated(true)
+    }
+  }, [])
+
+  const value = useMemo(
+    () => ({ user, isLoading, isAuthenticated, login, logout, refreshUser }),
+    [user, isLoading, isAuthenticated, login, logout, refreshUser]
+  )
+
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>
+}
+
+export function useAuth(): AuthContextValue {
+  const context = useContext(AuthContext)
+  if (!context) throw new Error('useAuth must be used within AuthProvider')
+  return context
+}

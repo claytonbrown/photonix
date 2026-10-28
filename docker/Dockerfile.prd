@@ -26,15 +26,14 @@ RUN apt-get update && \
                    /tmp/* \
                    /var/tmp/*
 
-# Install Node LTS
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+# Install Node 24.x LTS
+RUN curl -fsSL https://deb.nodesource.com/setup_24.x | bash - && \
     apt-get update && \
     apt-get install -y nodejs && \
          apt-get clean && \
             rm -rf /var/lib/apt/lists/* \
                    /tmp/* \
                    /var/tmp/*
-# npm is already included with Node.js
 
 # Install Python dependencies
 WORKDIR /srv
@@ -55,20 +54,23 @@ RUN --mount=type=secret,id=PYPI_UPLOAD_USERNAME \
      else python /root/install_and_upload_python_packages.py -u ${PYPI_UPLOAD_USERNAME} -p ${PYPI_UPLOAD_PASSWORD} ; \
     fi
 
-# Install NPM dependencies
+# Install NPM dependencies (include devDependencies for build tools like vite)
 COPY ui/package.json /srv/ui/package.json
 COPY ui/package-lock.json /srv/ui/package-lock.json
 WORKDIR /srv/ui
-ENV NODE_OPTIONS=--openssl-legacy-provider
-RUN npm install --legacy-peer-deps
+RUN npm install
 
 # Copy over the frontend code
 COPY ui/public /srv/ui/public
 COPY ui/src /srv/ui/src
+COPY ui/index.html /srv/ui/index.html
+COPY ui/vite.config.ts /srv/ui/vite.config.ts
+COPY ui/tsconfig.json /srv/ui/tsconfig.json
+COPY ui/tsconfig.app.json /srv/ui/tsconfig.app.json
+COPY ui/tsconfig.node.json /srv/ui/tsconfig.node.json
 
 # Build frontend app
-# Node option here solves heap out-of-memory issue when building Webpack bundle on machines that only have 1GB RAM
-RUN NODE_OPTIONS="--max-old-space-size=768 --openssl-legacy-provider" npm run build
+RUN NODE_OPTIONS="--max-old-space-size=768" npm run build
 
 # Remove large unused files in Python site-packages
 RUN find /usr/local/lib/python3.13 -type d -name  "__pycache__" -exec rm -r {} + && \
@@ -114,7 +116,16 @@ RUN rm -rf \
     /usr/local/lib/python3.13/site-packages/matplotlib/mpl-data/images \
     /usr/local/lib/python3.13/site-packages/matplotlib/mpl-data/stylelib \
     /usr/local/lib/python3.13/site-packages/tensorboard \
-    /usr/local/lib/python3.13/site-packages/tensorboard_plugin_wit
+    /usr/local/lib/python3.13/site-packages/tensorboard_plugin_wit \
+    /usr/local/lib/python3.13/site-packages/pytest \
+    /usr/local/lib/python3.13/site-packages/_pytest \
+    /usr/local/lib/python3.13/site-packages/pytest_django \
+    /usr/local/lib/python3.13/site-packages/pluggy \
+    /usr/local/lib/python3.13/site-packages/iniconfig \
+    /usr/local/lib/python3.13/site-packages/mock \
+    /usr/local/lib/python3.13/site-packages/factory \
+    /usr/local/lib/python3.13/site-packages/faker \
+    /usr/local/lib/python3.13/site-packages/coverage
 
 
 FROM ${ARCH}python:3.13-slim-trixie
@@ -155,8 +166,6 @@ WORKDIR /srv
 # Copy over the code
 COPY photonix /srv/photonix
 COPY manage.py /srv/manage.py
-COPY test.py /srv/test.py
-COPY tests /srv/tests
 COPY ui/public /srv/ui/public
 
 # Copy system config and init scripts
@@ -172,6 +181,10 @@ RUN groupadd -g $GID photonix && \
     useradd -u $UID -g $GID -s /bin/sh photonix && \
     chown -R photonix:photonix /srv /var/lib/nginx /var/log/nginx /var/run /run /tmp
 USER photonix
+
+# Long start period covers first-boot migrations and model downloads
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5m --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1/', timeout=5)"
 
 CMD ["./system/run.sh"]
 

@@ -1,8 +1,11 @@
 import os
+from datetime import timedelta
 
 from django.conf import settings
 from django.contrib.auth import get_user_model, load_backend, login
+from django.core.exceptions import ValidationError
 from django.db.models import Case, When, Value, IntegerField
+from django.utils import timezone
 import django_filters
 from django_filters import CharFilter, OrderingFilter
 import graphene
@@ -11,8 +14,10 @@ from graphene_django.types import DjangoObjectType
 from graphql_jwt.decorators import login_required
 from graphql import GraphQLError
 
+from photonix.accounts.schema import UserType
 from photonix.photos.utils.tasks import count_remaining_task
-from .models import Library, Camera, Lens, Photo, Tag, PhotoTag, LibraryPath, LibraryUser, PhotoFile, Task
+from photonix.web.utils import demo_user_locked
+from .models import Library, Camera, Lens, Photo, Tag, PhotoTag, LibraryInvitation, LibraryPath, LibraryUser, PhotoFile, Task
 from photonix.photos.utils.filter_photos import filter_photos_queryset, sort_photos_exposure
 from photonix.photos.utils.metadata import PhotoMetadata
 from django.db.models.functions import Lower
@@ -236,6 +241,60 @@ class LibrarySetting(graphene.ObjectType):
 
     library = graphene.Field(LibraryType)
     source_folder = graphene.String()
+    watch_photos = graphene.Boolean()
+    import_path = graphene.String()
+    delete_after_import = graphene.Boolean()
+
+
+def library_setting_dict(library):
+    """Shape a Library into the LibrarySetting response object."""
+    store_path = library.paths.filter(type='St').first()
+    import_path = library.paths.filter(type='Im').first()
+    return {
+        'library': library,
+        'source_folder': store_path.path if store_path else None,
+        'watch_photos': store_path.watch_for_changes if store_path else False,
+        'import_path': import_path.path if import_path else None,
+        'delete_after_import': import_path.delete_after_import if import_path else False,
+    }
+
+
+def require_library_owner(user, library_id):
+    """Return the Library if user is one of its owners, else raise.
+
+    The two conditions in one filter() call constrain the same LibraryUser
+    join row, so this cannot be satisfied by being a non-owner member of the
+    library while owning a different one.
+    """
+    library = Library.objects.filter(id=library_id, users__user=user, users__owner=True).first()
+    if not library:
+        raise GraphQLError('User is not the owner of library!')
+    return library
+
+
+class LibraryUserType(DjangoObjectType):
+    class Meta:
+        model = LibraryUser
+        fields = ('id', 'user', 'owner', 'created_at')
+
+
+class LibraryInvitationType(DjangoObjectType):
+    url = graphene.String()
+
+    class Meta:
+        model = LibraryInvitation
+        fields = ('id', 'created_by', 'created_at', 'expires_at')
+
+    def resolve_url(self, info):
+        return f'/invite/{self.id}'
+
+
+class InvitationInfo(graphene.ObjectType):
+    """Public preview of an invitation for the accept page."""
+
+    valid = graphene.Boolean()
+    library_name = graphene.String()
+    invited_by = graphene.String()
 
 class PhotoMetadataFields(graphene.ObjectType):
     """ Metadata about photo as extracted by exiftool """
@@ -280,6 +339,13 @@ class TaskType(graphene.ObjectType):
     classify_face = graphene.types.generic.GenericScalar()
 
 
+class PhotosAroundType(graphene.ObjectType):
+    """Response type for photos_around query."""
+    photo_ids = graphene.List(graphene.String)
+    rotations = graphene.types.generic.GenericScalar()
+    current_index = graphene.Int()
+
+
 class Query(graphene.ObjectType):
     all_libraries = graphene.List(LibraryType)
     camera = graphene.Field(CameraType, id=graphene.UUID(), make=graphene.String(), model=graphene.String())
@@ -299,6 +365,13 @@ class Query(graphene.ObjectType):
     photo = graphene.Field(PhotoNode, id=graphene.UUID())
     all_photos = DjangoFilterConnectionField(PhotoNode, filterset_class=PhotoFilter, max_limit=None)
     map_photos = DjangoFilterConnectionField(PhotoNode, filterset_class=PhotoFilter)
+    photos_around = graphene.Field(
+        PhotosAroundType,
+        photo_id=graphene.UUID(required=True),
+        count=graphene.Int(default_value=100),
+        multi_filter=graphene.String(),
+        description="Get photo IDs around a specific photo for navigation"
+    )
 
     all_location_tags = graphene.List(LocationTagType, library_id=graphene.UUID(), multi_filter=graphene.String())
     all_object_tags = graphene.List(ObjectTagType, library_id=graphene.UUID(), multi_filter=graphene.String())
@@ -308,6 +381,9 @@ class Query(graphene.ObjectType):
     all_event_tags = graphene.List(EventTagType, library_id=graphene.UUID(), multi_filter=graphene.String())
     all_generic_tags = graphene.List(LocationTagType, library_id=graphene.UUID(), multi_filter=graphene.String())
     library_setting = graphene.Field(LibrarySetting, library_id=graphene.UUID())
+    library_users = graphene.List(LibraryUserType, library_id=graphene.UUID(required=True))
+    library_invitations = graphene.List(LibraryInvitationType, library_id=graphene.UUID(required=True))
+    invitation_info = graphene.Field(InvitationInfo, token=graphene.String(required=True))
     photo_file_metadata = graphene.Field(PhotoMetadataFields, photo_file_id=graphene.UUID())
     album_list = DjangoFilterConnectionField(TagNode, library_id=graphene.UUID(), max_limit=None)
     task_progress = graphene.Field(TaskType)
@@ -319,15 +395,16 @@ class Query(graphene.ObjectType):
 
     @login_required
     def resolve_camera(self, info, **kwargs):
+        user = info.context.user
         id = kwargs.get('id')
         make = kwargs.get('make')
         model = kwargs.get('model')
 
         if id is not None:
-            return Camera.objects.get(pk=id)
+            return Camera.objects.for_user(user).get(pk=id)
 
         if make is not None and model is not None:
-            return Camera.objects.get(make=make, model=model)
+            return Camera.objects.for_user(user).get(make=make, model=model)
 
         return None
 
@@ -339,14 +416,15 @@ class Query(graphene.ObjectType):
 
     @login_required
     def resolve_lens(self, info, **kwargs):
+        user = info.context.user
         id = kwargs.get('id')
         name = kwargs.get('name')
 
         if id is not None:
-            return Lens.objects.get(pk=id)
+            return Lens.objects.for_user(user).get(pk=id)
 
         if name is not None:
-            return Lens.objects.get(name=name)
+            return Lens.objects.for_user(user).get(name=name)
 
         return None
 
@@ -395,7 +473,7 @@ class Query(graphene.ObjectType):
     def resolve_photo(self, info, **kwargs):
         id = kwargs.get('id')
         if id is not None:
-            return Photo.objects.get(pk=id)
+            return Photo.objects.for_user(info.context.user).get(pk=id)
         return None
 
     @login_required
@@ -407,6 +485,88 @@ class Query(graphene.ObjectType):
     def resolve_map_photos(self, info, **kwargs):
         user = info.context.user
         return Photo.objects.filter(library__users__user=user, deleted=False).exclude(latitude__isnull=True, longitude__isnull=True)
+
+    @login_required
+    def resolve_photos_around(self, info, **kwargs):
+        """
+        Fetch photo IDs around a specific photo for navigation.
+
+        Returns up to `count` photos before and after the specified photo,
+        in the default ordering (-taken_at). Also returns rotations for each photo.
+        When `multi_filter` is supplied, neighbours are restricted to photos
+        matching the filter so navigation stays within the filtered context.
+        """
+        user = info.context.user
+        photo_id = kwargs.get('photo_id')
+        count = kwargs.get('count', 100)
+        multi_filter = kwargs.get('multi_filter')
+
+        # Get the target photo, scoped to the requesting user's libraries so a
+        # caller can't discover another user's photo id/rotation by bare pk.
+        try:
+            target_photo = Photo.objects.for_user(user).get(pk=photo_id)
+        except Photo.DoesNotExist:
+            return None
+
+        # Base queryset - same as all_photos
+        base_qs = Photo.objects.filter(
+            library__users__user=user,
+            library=target_photo.library,
+            thumbnailed_version__isnull=False,
+            deleted=False
+        ).order_by('-taken_at')
+
+        # Restrict neighbours to the active search/filter context (same
+        # semantics as the all_photos multi_filter). The target photo itself is
+        # always included so the viewer can render it even if it no longer
+        # matches the filter.
+        if multi_filter:
+            filters = [
+                v for v in multi_filter.split(' ')
+                if v != '' and v not in ['in', 'near', 'during', 'taken', 'on', 'of']
+            ]
+            base_qs = filter_photos_queryset(filters, base_qs).order_by('-taken_at')
+
+        # Get photos taken after (or at same time but different id) - these come BEFORE in the list
+        # Since ordering is -taken_at, photos with later taken_at come first
+        photos_before_qs = base_qs.filter(
+            taken_at__gt=target_photo.taken_at
+        ).order_by('taken_at')[:count]  # Order ascending to get closest first
+        photos_before = list(reversed(photos_before_qs))  # Reverse to get proper order
+
+        # Get photos taken before (or at same time) - these come AFTER in the list
+        photos_after_qs = base_qs.filter(
+            taken_at__lt=target_photo.taken_at
+        ).order_by('-taken_at')[:count]
+        photos_after = list(photos_after_qs)
+
+        # Handle photos with same taken_at as target
+        same_time_photos = list(base_qs.filter(taken_at=target_photo.taken_at).exclude(id=photo_id))
+        for p in same_time_photos:
+            if str(p.id) < str(photo_id):
+                photos_after.insert(0, p)
+            else:
+                photos_before.append(p)
+
+        # Combine: before + target + after
+        all_photos = photos_before + [target_photo] + photos_after
+        photo_ids = [str(p.id) for p in all_photos]
+        current_index = len(photos_before)
+
+        # Build rotations dict
+        rotations = {}
+        for p in all_photos:
+            base_file = p.base_file
+            if base_file:
+                exif_rotation = getattr(base_file, 'exif_rotation', 0) or 0
+                user_rotation = getattr(base_file, 'user_rotation', 0) or 0
+                rotations[str(p.id)] = (exif_rotation + user_rotation) % 360
+
+        return {
+            'photo_ids': photo_ids,
+            'rotations': rotations,
+            'current_index': current_index,
+        }
 
     @login_required
     def resolve_all_location_tags(self, info, **kwargs):
@@ -528,17 +688,41 @@ class Query(graphene.ObjectType):
         """Api for library setting query."""
         # always pass a dictionary for `library_setting`
         user = info.context.user
-        libraries = Library.objects.filter(users__user=user, users__owner=True, id=kwargs.get('library_id'))
-        if libraries:
-            library_obj = libraries[0]
-            library_path = library_obj.paths.all()[0]
-            return {"library": library_obj, "source_folder": library_path.path}
-        raise Exception('User is not the owner of library!')
+        library = require_library_owner(user, kwargs.get('library_id'))
+        return library_setting_dict(library)
+
+    @login_required
+    def resolve_library_users(self, info, library_id):
+        user = info.context.user
+        # Any member may see who else is in the library; only owners may
+        # change memberships (mutations below).
+        if not Library.objects.filter(id=library_id, users__user=user).exists():
+            raise GraphQLError('User is not a member of library!')
+        return LibraryUser.objects.filter(library_id=library_id).select_related('user').order_by('created_at')
+
+    @login_required
+    def resolve_library_invitations(self, info, library_id):
+        user = info.context.user
+        require_library_owner(user, library_id)
+        return LibraryInvitation.objects.filter(
+            library_id=library_id, revoked=False, accepted_at__isnull=True,
+            expires_at__gt=timezone.now()).order_by('created_at')
+
+    def resolve_invitation_info(self, info, token):
+        # Public by design: the unguessable token is the authorization.
+        invitation = LibraryInvitation.get_valid(token)
+        if not invitation:
+            return {'valid': False}
+        return {
+            'valid': True,
+            'library_name': invitation.library.name,
+            'invited_by': invitation.created_by.username,
+        }
 
     @login_required
     def resolve_photo_file_metadata(self, info, **kwargs):
         """Return metadata for photofile."""
-        photo_file = PhotoFile.objects.filter(id=kwargs.get('photo_file_id'))
+        photo_file = PhotoFile.objects.for_user(info.context.user).filter(id=kwargs.get('photo_file_id'))
         if photo_file and os.path.exists(photo_file[0].path):
             metadata = PhotoMetadata(photo_file[0].path)
             return {
@@ -575,6 +759,7 @@ class LibraryInput(graphene.InputObjectType):
     classification_object_enabled = graphene.Boolean()
     classification_face_enabled = graphene.Boolean()
     source_folder = graphene.String(required=False)
+    watch_photos = graphene.Boolean(required=False)
     user_id = graphene.ID()
     library_id = graphene.ID()
 
@@ -756,12 +941,271 @@ class UpdateLibrarySourceFolder(graphene.Mutation):
             library_path.path = input.source_folder
             library_path.save()
             return UpdateLibrarySourceFolder(
-                ok=ok,
+                ok=True,
                 source_folder=library_path.path)
         if not libraries:
             raise Exception('User is not the owner of library!')
         else:
             return UpdateLibrarySourceFolder(ok=ok, source_folder=None)
+
+
+class UpdateLibraryWatchPhotos(graphene.Mutation):
+    """Persist the per-library "watch folder for new photos" toggle."""
+
+    class Arguments:
+        input = LibraryInput(required=False)
+
+    ok = graphene.Boolean()
+    watch_photos = graphene.Boolean()
+
+    @staticmethod
+    def mutate(root, info, input=None):
+        user = info.context.user
+        libraries = Library.objects.filter(users__user=user, users__owner=True, id=input.library_id)
+        if not libraries:
+            raise Exception('User is not the owner of library!')
+        if str(input.get('watch_photos')) == 'None':
+            return UpdateLibraryWatchPhotos(ok=False, watch_photos=None)
+        watch = input.watch_photos
+        libraries[0].paths.all().update(watch_for_changes=watch)
+        return UpdateLibraryWatchPhotos(ok=True, watch_photos=watch)
+
+
+class UpdateLibraryInput(graphene.InputObjectType):
+    """Partial update: only fields that are present are applied."""
+
+    library_id = graphene.ID(required=True)
+    name = graphene.String()
+    source_folder = graphene.String()
+    watch_photos = graphene.Boolean()
+    # Empty string removes the import path; non-empty creates or updates it.
+    import_path = graphene.String()
+    delete_after_import = graphene.Boolean()
+    classification_color_enabled = graphene.Boolean()
+    classification_location_enabled = graphene.Boolean()
+    classification_style_enabled = graphene.Boolean()
+    classification_object_enabled = graphene.Boolean()
+    classification_face_enabled = graphene.Boolean()
+
+
+LIBRARY_CLASSIFICATION_FIELDS = (
+    'classification_color_enabled',
+    'classification_location_enabled',
+    'classification_style_enabled',
+    'classification_object_enabled',
+    'classification_face_enabled',
+)
+
+
+class UpdateLibrary(graphene.Mutation):
+    """Owner-only consolidated settings update, replacing the historical
+    single-field update* mutations (kept for backwards compatibility)."""
+
+    class Arguments:
+        input = UpdateLibraryInput(required=True)
+
+    ok = graphene.Boolean()
+    library_setting = graphene.Field(LibrarySetting)
+
+    @staticmethod
+    @login_required
+    def mutate(root, info, input):
+        user = info.context.user
+        library = require_library_owner(user, input.library_id)
+        if demo_user_locked(user):
+            raise GraphQLError('Library cannot be changed in demo mode!')
+
+        if input.get('name') is not None:
+            name = input.name.strip()
+            if not name:
+                raise GraphQLError('Library name cannot be blank!')
+            library.name = name
+        for field in LIBRARY_CLASSIFICATION_FIELDS:
+            if input.get(field) is not None:
+                setattr(library, field, input.get(field))
+        library.save()
+
+        store_path = library.paths.filter(type='St').first()
+        if store_path:
+            if input.get('source_folder') is not None:
+                source_folder = input.source_folder.strip()
+                if not source_folder:
+                    raise GraphQLError('Source folder cannot be blank!')
+                store_path.path = source_folder
+            if input.get('watch_photos') is not None:
+                store_path.watch_for_changes = input.watch_photos
+            store_path.save()
+
+        import_path = library.paths.filter(type='Im').first()
+        if input.get('import_path') is not None:
+            value = input.import_path.strip()
+            if not value:
+                if import_path:
+                    import_path.delete()
+            elif import_path:
+                import_path.path = value
+                if input.get('delete_after_import') is not None:
+                    import_path.delete_after_import = input.delete_after_import
+                import_path.save()
+            else:
+                LibraryPath.objects.create(
+                    library=library, type='Im', backend_type='Lo', path=value,
+                    delete_after_import=bool(input.get('delete_after_import')))
+        elif input.get('delete_after_import') is not None and import_path:
+            import_path.delete_after_import = input.delete_after_import
+            import_path.save()
+
+        return UpdateLibrary(ok=True, library_setting=library_setting_dict(library))
+
+
+class AddLibraryUser(graphene.Mutation):
+    class Arguments:
+        library_id = graphene.ID(required=True)
+        username = graphene.String(required=True)
+
+    ok = graphene.Boolean()
+
+    @staticmethod
+    @login_required
+    def mutate(root, info, library_id, username):
+        user = info.context.user
+        library = require_library_owner(user, library_id)
+        if demo_user_locked(user):
+            raise GraphQLError('Members cannot be managed in demo mode!')
+        # Exact-match only — there is intentionally no username search API,
+        # and this message doesn't reveal whether the username exists.
+        target = User.objects.filter(username=username.strip(), is_active=True).first()
+        if not target:
+            raise GraphQLError('Unable to add that user to the library')
+        LibraryUser.objects.get_or_create(library=library, user=target, defaults={'owner': False})
+        return AddLibraryUser(ok=True)
+
+
+def _is_last_owner(membership):
+    return membership.owner and not LibraryUser.objects.filter(
+        library_id=membership.library_id, owner=True).exclude(pk=membership.pk).exists()
+
+
+class RemoveLibraryUser(graphene.Mutation):
+    class Arguments:
+        library_id = graphene.ID(required=True)
+        user_id = graphene.ID(required=True)
+
+    ok = graphene.Boolean()
+
+    @staticmethod
+    @login_required
+    def mutate(root, info, library_id, user_id):
+        user = info.context.user
+        # Members may remove themselves (leave the library); removing anyone
+        # else requires ownership.
+        if str(user_id) != str(user.pk):
+            require_library_owner(user, library_id)
+        if demo_user_locked(user):
+            raise GraphQLError('Members cannot be managed in demo mode!')
+        membership = LibraryUser.objects.filter(library_id=library_id, user_id=user_id).first()
+        if not membership:
+            raise GraphQLError('User is not a member of library!')
+        if _is_last_owner(membership):
+            raise GraphQLError('Cannot remove the last owner of a library!')
+        membership.delete()
+        return RemoveLibraryUser(ok=True)
+
+
+class SetLibraryUserOwner(graphene.Mutation):
+    class Arguments:
+        library_id = graphene.ID(required=True)
+        user_id = graphene.ID(required=True)
+        owner = graphene.Boolean(required=True)
+
+    ok = graphene.Boolean()
+
+    @staticmethod
+    @login_required
+    def mutate(root, info, library_id, user_id, owner):
+        user = info.context.user
+        require_library_owner(user, library_id)
+        if demo_user_locked(user):
+            raise GraphQLError('Members cannot be managed in demo mode!')
+        membership = LibraryUser.objects.filter(library_id=library_id, user_id=user_id).first()
+        if not membership:
+            raise GraphQLError('User is not a member of library!')
+        if not owner and _is_last_owner(membership):
+            raise GraphQLError('Cannot remove the last owner of a library!')
+        membership.owner = owner
+        membership.save()
+        return SetLibraryUserOwner(ok=True)
+
+
+class CreateLibraryInvitation(graphene.Mutation):
+    class Arguments:
+        library_id = graphene.ID(required=True)
+        expires_days = graphene.Int()
+
+    ok = graphene.Boolean()
+    invitation = graphene.Field(LibraryInvitationType)
+
+    @staticmethod
+    @login_required
+    def mutate(root, info, library_id, expires_days=14):
+        user = info.context.user
+        library = require_library_owner(user, library_id)
+        if demo_user_locked(user):
+            raise GraphQLError('Invitations cannot be created in demo mode!')
+        expires_days = max(1, min(expires_days or 14, 90))
+        invitation = LibraryInvitation.objects.create(
+            library=library, created_by=user,
+            expires_at=timezone.now() + timedelta(days=expires_days))
+        return CreateLibraryInvitation(ok=True, invitation=invitation)
+
+
+class RevokeLibraryInvitation(graphene.Mutation):
+    class Arguments:
+        invitation_id = graphene.ID(required=True)
+
+    ok = graphene.Boolean()
+
+    @staticmethod
+    @login_required
+    def mutate(root, info, invitation_id):
+        user = info.context.user
+        try:
+            invitation = LibraryInvitation.objects.filter(
+                pk=invitation_id, library__users__user=user, library__users__owner=True).first()
+        except (ValidationError, ValueError):
+            invitation = None
+        if not invitation:
+            raise GraphQLError('User is not the owner of library!')
+        invitation.revoked = True
+        invitation.save()
+        return RevokeLibraryInvitation(ok=True)
+
+
+class AcceptLibraryInvitation(graphene.Mutation):
+    """Join a library with an invitation token while logged in."""
+
+    class Arguments:
+        token = graphene.String(required=True)
+
+    ok = graphene.Boolean()
+    library_id = graphene.ID()
+
+    @staticmethod
+    @login_required
+    def mutate(root, info, token):
+        user = info.context.user
+        invitation = LibraryInvitation.get_valid(token)
+        if not invitation:
+            raise GraphQLError('Invitation is no longer valid!')
+        membership, created = LibraryUser.objects.get_or_create(
+            library=invitation.library, user=user, defaults={'owner': False})
+        if created:
+            # Idempotent for existing members: the invitation is only
+            # consumed when it actually granted a membership.
+            invitation.accepted_by = user
+            invitation.accepted_at = timezone.now()
+            invitation.save()
+        return AcceptLibraryInvitation(ok=True, library_id=invitation.library_id)
 
 
 class CreateLibraryInput(graphene.InputObjectType):
@@ -773,7 +1217,22 @@ class CreateLibraryInput(graphene.InputObjectType):
     url = graphene.String(required=False)
     s3_access_key_id = graphene.String(required=False)
     s3_secret_key = graphene.String(required=False)
-    user_id = graphene.ID(required=True)
+    # Only sent by the first-run onboarding wizard; the settings area omits it
+    # and acts as the authenticated user without touching onboarding flags.
+    user_id = graphene.ID(required=False)
+
+
+def get_onboarding_user(info, user_id):
+    # The onboarding mutations historically trusted the userId argument from
+    # unauthenticated callers, letting anyone act on (and ultimately be logged
+    # in as) an arbitrary account. CreateUser now starts a session, so require
+    # the caller to be that same user.
+    user = info.context.user
+    if not user.is_authenticated:
+        raise GraphQLError('Not logged in')
+    if str(user.pk) != str(user_id):
+        raise GraphQLError('Cannot perform onboarding for another user')
+    return user
 
 
 class CreateLibrary(graphene.Mutation):
@@ -793,7 +1252,21 @@ class CreateLibrary(graphene.Mutation):
     @staticmethod
     def mutate(self, info, input=None):
         """Mutate method."""
-        library_obj = Library.objects.create(name=input.name)
+        is_onboarding = input.get('user_id') is not None
+        if is_onboarding:
+            user = get_onboarding_user(info, input.user_id)
+        else:
+            user = info.context.user
+            if not user.is_authenticated:
+                raise GraphQLError('Not logged in')
+            if demo_user_locked(user):
+                raise GraphQLError('Library cannot be created in demo mode!')
+        name = input.name.strip()
+        if not name:
+            raise GraphQLError('Library name cannot be blank!')
+        if not input.path.strip():
+            raise GraphQLError('Library path cannot be blank!')
+        library_obj = Library.objects.create(name=name)
         if input.backend_type == 'Lo':
             library_path_obj = LibraryPath.objects.create(
                 library=library_obj, type="St",
@@ -804,9 +1277,9 @@ class CreateLibrary(graphene.Mutation):
                 type="St", path=input.path, url=input.get('url'),
                 s3_access_key_id=input.s3_access_key_id,
                 s3_secret_key=input.s3_secret_key)
-        user = User.objects.get(pk=input.user_id)
-        user.has_created_library = True
-        user.save()
+        if is_onboarding:
+            user.has_created_library = True
+            user.save()
         LibraryUser.objects.create(
             library=library_obj, user=user, owner=True)
         return CreateLibrary(
@@ -843,15 +1316,23 @@ class PhotoImporting(graphene.Mutation):
     @staticmethod
     def mutate(self, info, input=None):
         """Mutate method."""
-        library_path_obj = LibraryPath.objects.get(pk=input.library_path_id)
+        user = get_onboarding_user(info, input.user_id)
+        try:
+            library_path_obj = LibraryPath.objects.get(
+                pk=input.library_path_id, library__users__user=user)
+        except LibraryPath.DoesNotExist:
+            raise GraphQLError('Library path not found')
         library_path_obj.watch_for_changes = input.watch_for_changes
         library_path_obj.save()
         if input.add_another_path:
+            try:
+                library = Library.objects.get(pk=input.library_id, users__user=user)
+            except Library.DoesNotExist:
+                raise GraphQLError('Library not found')
             LibraryPath.objects.create(
-                library=Library.objects.get(pk=input.library_id),
+                library=library,
                 type="Im", backend_type="Lo",
                 path=input.import_path, delete_after_import=input.delete_after_import)
-        user = User.objects.get(pk=input.user_id)
         user.has_configured_importing = True
         user.save()
         return PhotoImporting(
@@ -874,14 +1355,17 @@ class ImageAnalysis(graphene.Mutation):
     @staticmethod
     def mutate(self, info, input=None):
         """Mutate method."""
-        library_obj = Library.objects.get(pk=input.library_id)
+        user = get_onboarding_user(info, input.user_id)
+        try:
+            library_obj = Library.objects.get(pk=input.library_id, users__user=user)
+        except Library.DoesNotExist:
+            raise GraphQLError('Library not found')
         library_obj.classification_color_enabled = input.classification_color_enabled
         library_obj.classification_location_enabled = input.classification_location_enabled
         library_obj.classification_style_enabled = input.classification_style_enabled
         library_obj.classification_object_enabled = input.classification_object_enabled
         library_obj.classification_face_enabled = input.classification_face_enabled
         library_obj.save()
-        user = User.objects.get(pk=input.user_id)
         # Only auto-login as part of genuine first-run onboarding, i.e. when this
         # user is completing image-analysis configuration for the very first time.
         # Without this guard the mutation would grant a session for ANY user_id
@@ -915,10 +1399,11 @@ class PhotoRating(graphene.Mutation):
     photo = graphene.Field(PhotoNode)
 
     @staticmethod
+    @login_required
     def mutate(self, info, photo_id=None, star_rating=None):
         try:
             if 0 <= star_rating <= 5:
-                photo_obj = Photo.objects.get(pk=photo_id)
+                photo_obj = Photo.objects.for_user(info.context.user).get(pk=photo_id)
                 photo_obj.star_rating = star_rating
                 photo_obj.save()
                 return PhotoRating(ok=True, photo=photo_obj)
@@ -938,9 +1423,10 @@ class CreateGenricTag(graphene.Mutation):
     name = graphene.String()
 
     @staticmethod
+    @login_required
     def mutate(self, info, name=None, photo_id=None):
         try:
-            photo_obj = Photo.objects.get(id=photo_id)
+            photo_obj = Photo.objects.for_user(info.context.user).get(id=photo_id)
         except Exception as e:
             raise GraphQLError("Invalid photo id!")
         tag_obj, created = Tag.objects.get_or_create(
@@ -971,10 +1457,13 @@ class RemoveGenericTag(graphene.Mutation):
     ok = graphene.Boolean()
 
     @staticmethod
+    @login_required
     def mutate(self, info, photo_id=None, tag_id=None):
-        Photo.objects.get(id=photo_id).photo_tags.remove(PhotoTag.objects.get(photo_id=photo_id, tag__id=tag_id))
+        user = info.context.user
+        photo = Photo.objects.for_user(user).get(id=photo_id)
+        photo.photo_tags.remove(PhotoTag.objects.get(photo_id=photo_id, tag__id=tag_id))
         if Photo.objects.filter(photo_tags__tag__id=tag_id).count() == 0:
-            Tag.objects.get(id=tag_id).delete()
+            Tag.objects.for_user(user).get(id=tag_id).delete()
         return RemoveGenericTag(ok=True)
 
 
@@ -989,6 +1478,7 @@ class ChangePreferredPhotoFile(graphene.Mutation):
     ok = graphene.Boolean()
 
     @staticmethod
+    @login_required
     def mutate(self, info, selected_photo_file_id=None):
         """Mutation to update preferred_photo_file for photo.
 
@@ -997,8 +1487,9 @@ class ChangePreferredPhotoFile(graphene.Mutation):
         """
         from photonix.photos.utils.tasks import queue_reclassification_for_photo
 
-        photo_obj = PhotoFile.objects.get(id=selected_photo_file_id).photo
-        photo_obj.preferred_photo_file = PhotoFile.objects.get(id=selected_photo_file_id)
+        photo_file = PhotoFile.objects.for_user(info.context.user).get(id=selected_photo_file_id)
+        photo_obj = photo_file.photo
+        photo_obj.preferred_photo_file = photo_file
         photo_obj.save()
         Task(type='generate_thumbnails', subject_id=photo_obj.id, library=photo_obj.library).save()
 
@@ -1019,10 +1510,11 @@ class EditFaceTag(graphene.Mutation):
     ok = graphene.Boolean()
 
     @staticmethod
+    @login_required
     def mutate(self, info, photo_tag_id=None, new_name=None):
         """Mutation to create or update face tags and assign them to photoTag."""
-        obj = Tag.objects.filter(name=new_name, type='F').first()
-        photo_tag = PhotoTag.objects.get(id=photo_tag_id)
+        photo_tag = PhotoTag.objects.for_user(info.context.user).get(id=photo_tag_id)
+        obj = Tag.objects.filter(library=photo_tag.photo.library, name=new_name, type='F').first()
         already_assigned_tag = photo_tag.tag
         if obj:
             photo_tag.tag = obj
@@ -1049,9 +1541,10 @@ class BlockFaceTag(graphene.Mutation):
     ok = graphene.Boolean()
 
     @staticmethod
+    @login_required
     def mutate(self, info, photo_tag_id=None, new_name=None):
         """Mutation to block a face 'F' type photoTag."""
-        photo_tag = PhotoTag.objects.get(id=photo_tag_id)
+        photo_tag = PhotoTag.objects.for_user(info.context.user).get(id=photo_tag_id)
         photo_tag.deleted = True
         photo_tag.verified = False
         photo_tag.confidence = 0
@@ -1070,9 +1563,10 @@ class VerifyPhoto(graphene.Mutation):
     ok = graphene.Boolean()
 
     @staticmethod
+    @login_required
     def mutate(self, info, photo_tag_id=None, new_name=None):
         """Mutation to set verify a face 'F' type photoTag."""
-        photo_tag = PhotoTag.objects.get(id=photo_tag_id)
+        photo_tag = PhotoTag.objects.for_user(info.context.user).get(id=photo_tag_id)
         photo_tag.verified = True
         photo_tag.confidence = 1
         photo_tag.save()
@@ -1089,9 +1583,10 @@ class AssignTagToPhotos(graphene.Mutation):
     ok = graphene.Boolean()
 
     @staticmethod
+    @login_required
     def mutate(self, info, name, photo_ids, tag_type):
         try:
-            photo_list = Photo.objects.filter(id__in=photo_ids.split(',')) 
+            photo_list = Photo.objects.for_user(info.context.user).filter(id__in=photo_ids.split(','))
             tag_obj, created = Tag.objects.get_or_create(
                 library=photo_list[0].library,
                 name=name, type=tag_type, source='H', defaults={})            
@@ -1121,10 +1616,11 @@ class SetPhotosDeleted(graphene.Mutation):
     ok = graphene.Boolean()
 
     @staticmethod
+    @login_required
     def mutate(self, info, photo_ids):
         """Mutation to set delete field true for a photo objects."""
         try:
-            photo_list = Photo.objects.filter(id__in=photo_ids.split(','))       
+            photo_list = Photo.objects.for_user(info.context.user).filter(id__in=photo_ids.split(','))
             for photo in photo_list:
                 photo.deleted = True
                 photo.save() 
@@ -1145,11 +1641,12 @@ class RemovePhotosFromAlbum(graphene.Mutation):
     ok = graphene.Boolean()
 
     @staticmethod
+    @login_required
     def mutate(self, info, photo_ids, album_id):
         """Mutation remove photos from particular album tag."""
         try:
             for photo_id in photo_ids.split(','):
-                photo_tag = PhotoTag.objects.get(photo__id=photo_id,tag__id=album_id)
+                photo_tag = PhotoTag.objects.for_user(info.context.user).get(photo__id=photo_id,tag__id=album_id)
                 photo_tag.delete()
             return RemovePhotosFromAlbum(ok=True)
         except Exception as e:
@@ -1168,6 +1665,7 @@ class SavePhotoFileRotation(graphene.Mutation):
     rotation = graphene.Int()
 
     @staticmethod
+    @login_required
     def mutate(self, info, photo_file_id=None, rotation=None):
         """Mutation to save photoFile rotation.
 
@@ -1180,7 +1678,7 @@ class SavePhotoFileRotation(graphene.Mutation):
         from photonix.photos.utils.tasks import queue_reclassification_for_photo
 
         if photo_file_id and rotation in [0, 90, 180, 270]:
-            photofile_obj = PhotoFile.objects.get(id=photo_file_id)
+            photofile_obj = PhotoFile.objects.for_user(info.context.user).get(id=photo_file_id)
             photofile_obj.user_rotation = rotation
             photofile_obj.save()
 
@@ -1198,6 +1696,14 @@ class Mutation(graphene.ObjectType):
     update_object_enabled = UpdateLibraryObjectEnabled.Field()
     update_face_enabled = UpdateLibraryFaceEnabled.Field()
     update_source_folder = UpdateLibrarySourceFolder.Field()
+    update_watch_photos = UpdateLibraryWatchPhotos.Field()
+    update_library = UpdateLibrary.Field()
+    add_library_user = AddLibraryUser.Field()
+    remove_library_user = RemoveLibraryUser.Field()
+    set_library_user_owner = SetLibraryUserOwner.Field()
+    create_library_invitation = CreateLibraryInvitation.Field()
+    revoke_library_invitation = RevokeLibraryInvitation.Field()
+    accept_library_invitation = AcceptLibraryInvitation.Field()
     create_library = CreateLibrary.Field()
     Photo_importing = PhotoImporting.Field()
     image_analysis = ImageAnalysis.Field()

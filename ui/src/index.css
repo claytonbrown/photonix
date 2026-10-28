@@ -1,0 +1,264 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+/*
+ * Photonix is a dark-only app. The `dark` class is set on <html> (see
+ * index.html) so shadcn/Radix components resolve to the dark palette and
+ * Tailwind `dark:` utilities are always active. The design tokens below are
+ * defined on both :root and .dark so the dark palette applies regardless.
+ */
+@custom-variant dark (&:is(.dark *));
+
+:root {
+  /* Radius: ~10px house style. rounded-lg (cards/dialogs) = 10px,
+     rounded-md (buttons/inputs) = 8px, rounded-sm = 6px. */
+  --radius: 0.625rem;
+
+  --background: #1d1d1d;
+  --foreground: #f5f5f5;
+  --card: #333333;
+  --card-foreground: #f5f5f5;
+  --popover: #444444;
+  --popover-foreground: #f5f5f5;
+  --primary: #00a8a1;
+  --primary-foreground: #ffffff;
+  --secondary: #3f3f3f;
+  --secondary-foreground: #e5e5e5;
+  --muted: #333333;
+  --muted-foreground: #a3a3a3;
+  --accent: #4a4a4a;
+  --accent-foreground: #f5f5f5;
+  --destructive: #ef4444;
+  --destructive-foreground: #ffffff;
+  --border: #4b4b4b;
+  --input: #5a5a5a;
+  --ring: #00a8a1;
+
+  /* Photonix master brand accent strip (5 equal segments) */
+  --brand-1: #005461;
+  --brand-2: #00a8a1;
+  --brand-3: #f5a51e;
+  --brand-4: #f5791e;
+  --brand-5: #f54820;
+}
+
+.dark {
+  --background: #1d1d1d;
+  --foreground: #f5f5f5;
+  --card: #333333;
+  --card-foreground: #f5f5f5;
+  --popover: #444444;
+  --popover-foreground: #f5f5f5;
+  --primary: #00a8a1;
+  --primary-foreground: #ffffff;
+  --secondary: #3f3f3f;
+  --secondary-foreground: #e5e5e5;
+  --muted: #333333;
+  --muted-foreground: #a3a3a3;
+  --accent: #4a4a4a;
+  --accent-foreground: #f5f5f5;
+  --destructive: #ef4444;
+  --destructive-foreground: #ffffff;
+  --border: #4b4b4b;
+  --input: #5a5a5a;
+  --ring: #00a8a1;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+@layer base {
+  * {
+    border-color: var(--border);
+    outline-color: color-mix(in oklch, var(--ring) 50%, transparent);
+  }
+  body {
+    background-color: var(--background);
+    color: var(--foreground);
+  }
+}
+
+/* Nunito Font - latin-ext, light (300) */
+@font-face {
+  font-family: 'Nunito';
+  font-style: normal;
+  font-weight: 300;
+  src: local('Nunito Light'), local('Nunito-Light'),
+    url(./fonts/XRXW3I6Li01BKofAnsSUb-vISTs.woff2) format('woff2');
+  unicode-range: U+0100-024F, U+0259, U+1E00-1EFF, U+2020, U+20A0-20AB,
+    U+20AD-20CF, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+/* Nunito Font - latin, light (300) */
+@font-face {
+  font-family: 'Nunito';
+  font-style: normal;
+  font-weight: 300;
+  src: local('Nunito Light'), local('Nunito-Light'),
+    url(./fonts/XRXW3I6Li01BKofAnsSUYevI.woff2) format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA,
+    U+02DC, U+2000-206F, U+2074, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215,
+    U+FEFF, U+FFFD;
+}
+/* Nunito Font - latin-ext, regular (400) */
+@font-face {
+  font-family: 'Nunito';
+  font-style: normal;
+  font-weight: 400;
+  src: local('Nunito Regular'), local('Nunito-Regular'),
+    url(./fonts/XRXV3I6Li01BKofIO-aBXso.woff2) format('woff2');
+  unicode-range: U+0100-024F, U+0259, U+1E00-1EFF, U+2020, U+20A0-20AB,
+    U+20AD-20CF, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+/* Nunito Font - latin, regular (400) */
+@font-face {
+  font-family: 'Nunito';
+  font-style: normal;
+  font-weight: 400;
+  src: local('Nunito Regular'), local('Nunito-Regular'),
+    url(./fonts/XRXV3I6Li01BKofINeaB.woff2) format('woff2');
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA,
+    U+02DC, U+2000-206F, U+2074, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215,
+    U+FEFF, U+FFFD;
+}
+
+body {
+  font-family: Nunito, Ubuntu, Roboto, -apple-system-body, BlinkMacSystemFont,
+    sans-serif;
+  font-weight: 300;
+}
+
+h1,
+h2,
+h3 {
+  font-weight: 400;
+}
+
+h1 {
+  font-size: 30px;
+}
+
+h2 {
+  font-size: 25px;
+}
+
+/*
+ * Global scrollbar styling. The old UI hid every native scrollbar; the rewrite
+ * keeps content discoverable with thin, dark-native overlay-feel bars instead
+ * of chunky OS defaults. Scoped to the app root (not a blanket html hide) so
+ * every overflow container stays scrollable. Radix ScrollArea viewports draw
+ * their own bar and hide the native one, so they are excluded here.
+ */
+@media (pointer: fine) {
+  #root *:not([data-radix-scroll-area-viewport])::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  #root *:not([data-radix-scroll-area-viewport])::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  #root *:not([data-radix-scroll-area-viewport])::-webkit-scrollbar-thumb {
+    background-color: rgba(255, 255, 255, 0.18);
+    border-radius: 9999px;
+  }
+  #root
+    *:not([data-radix-scroll-area-viewport])::-webkit-scrollbar-thumb:hover {
+    background-color: rgba(255, 255, 255, 0.3);
+  }
+  #root *:not([data-radix-scroll-area-viewport])::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+  /* Firefox */
+  #root *:not([data-radix-scroll-area-viewport]) {
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255, 255, 255, 0.18) transparent;
+  }
+}
+
+/* Touch / coarse pointers: hide scrollbars entirely, content scrolls naturally. */
+@media (pointer: coarse) {
+  #root *::-webkit-scrollbar {
+    width: 0;
+    height: 0;
+  }
+  #root * {
+    scrollbar-width: none;
+  }
+}
+
+/* Circular photo markers on the map view */
+.leaflet-photo-icon {
+  border: 1px solid rgba(255, 255, 255, 0.9);
+  border-radius: 50%;
+  overflow: hidden;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+  background: rgba(255, 255, 255, 0.15);
+  cursor: pointer;
+}
+
+.leaflet-pin-icon span {
+  display: block;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #14b8a6;
+  border: 2px solid #fff;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+}
+
+/* Dual-handle range slider (filters panel) */
+.dual-range {
+  pointer-events: none;
+  position: absolute;
+  width: 100%;
+  height: 0;
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  margin: 0;
+}
+.dual-range::-webkit-slider-thumb {
+  pointer-events: auto;
+  -webkit-appearance: none;
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #14b8a6;
+  border: 2px solid #fff;
+  cursor: pointer;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+}
+.dual-range::-moz-range-thumb {
+  pointer-events: auto;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #14b8a6;
+  border: 2px solid #fff;
+  cursor: pointer;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+}

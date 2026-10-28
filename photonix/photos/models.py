@@ -19,6 +19,24 @@ LIBRARY_SETUP_STAGE_COMPLETED_CHOICES = (
 )
 
 
+class ForUserQuerySet(models.QuerySet):
+    """Scopes lookups to libraries the given user is a member of.
+
+    API resolvers must never look objects up by bare primary key - always go
+    through for_user() so one user can't read or mutate another's data.
+    """
+    user_path = 'library__users__user'
+
+    def for_user(self, user):
+        if user is None or user.is_anonymous:
+            return self.none()
+        return self.filter(**{self.user_path: user})
+
+
+class PhotoRelatedForUserQuerySet(ForUserQuerySet):
+    user_path = 'photo__library__users__user'
+
+
 class Library(UUIDModel, VersionedModel):
     name = models.CharField(max_length=128, help_text='Display name of the library')
     classification_color_enabled = models.BooleanField(default=False, help_text='Run color analysis on photos?')
@@ -84,12 +102,51 @@ class LibraryUser(UUIDModel, VersionedModel):
         return f'{self.library.name} ({self.user.username})'
 
 
+class LibraryInvitation(UUIDModel, VersionedModel):
+    """Shareable invitation to join a Library as a non-owner member.
+
+    The uuid4 primary key is the capability token (the same trust model as
+    thumbnail/download URLs): possession of the invite link is the grant.
+    Single-use, expiring and revocable.
+    """
+    library = models.ForeignKey(Library, related_name='invitations', on_delete=models.CASCADE)
+    created_by = models.ForeignKey(User, related_name='invitations_sent', on_delete=models.CASCADE)
+    expires_at = models.DateTimeField(help_text='Invitation cannot be accepted after this time')
+    revoked = models.BooleanField(default=False, help_text='Invitation was withdrawn by a library owner')
+    accepted_by = models.ForeignKey(User, blank=True, null=True, related_name='invitations_accepted', on_delete=models.SET_NULL)
+    accepted_at = models.DateTimeField(blank=True, null=True)
+
+    def __str__(self):
+        return f'{self.library.name} invitation ({self.id})'
+
+    @property
+    def valid(self):
+        return not self.revoked and self.accepted_at is None and self.expires_at > timezone.now()
+
+    @classmethod
+    def get_valid(cls, token):
+        """Return the invitation for a raw token string, or None.
+
+        None for malformed tokens, unknown tokens and known-but-spent/expired/
+        revoked ones alike, so callers can't distinguish (no token oracle).
+        """
+        from django.core.exceptions import ValidationError
+
+        try:
+            invitation = cls.objects.select_related('library', 'created_by').get(pk=token)
+        except (cls.DoesNotExist, ValidationError, ValueError):
+            return None
+        return invitation if invitation.valid else None
+
+
 class Camera(UUIDModel, VersionedModel):
     library = models.ForeignKey(Library, related_name='cameras', on_delete=models.CASCADE)
     make = models.CharField(max_length=128)
     model = models.CharField(max_length=128)
     earliest_photo = models.DateTimeField()
     latest_photo = models.DateTimeField()
+
+    objects = ForUserQuerySet.as_manager()
 
     class Meta:
         unique_together = [['library', 'make', 'model']]
@@ -104,6 +161,8 @@ class Lens(UUIDModel, VersionedModel):
     name = models.CharField(max_length=128)
     earliest_photo = models.DateTimeField()
     latest_photo = models.DateTimeField()
+
+    objects = ForUserQuerySet.as_manager()
 
     class Meta:
         verbose_name_plural = 'lenses'
@@ -136,6 +195,8 @@ class Photo(UUIDModel, VersionedModel):
     preferred_photo_file = models.ForeignKey('PhotoFile', related_name='+', null=True, on_delete=models.SET_NULL)  # File selected by the user that is the best version to be used
     thumbnailed_version = models.PositiveIntegerField(default=0)  # Version from photos.utils.thumbnails.THUMBNAILER_VERSION at time of generating the required thumbnails declared in settings.THUMBNAIL_SIZES
     deleted = models.BooleanField(default=False)
+
+    objects = ForUserQuerySet.as_manager()
 
     class Meta:
         ordering = ['-taken_at']
@@ -230,6 +291,8 @@ class PhotoFile(UUIDModel, VersionedModel):
     exif_rotation = models.PositiveIntegerField(null=True, default=0)
     user_rotation = models.PositiveIntegerField(null=True, default=0)
 
+    objects = PhotoRelatedForUserQuerySet.as_manager()
+
     def __str__(self):
         return str(self.path)
 
@@ -270,6 +333,8 @@ class Tag(UUIDModel, VersionedModel):
     source = models.CharField(max_length=1, choices=SOURCE_CHOICES, db_index=True)
     ordering = models.FloatField(null=True)
 
+    objects = ForUserQuerySet.as_manager()
+
     class Meta:
         ordering = ['ordering', 'name']
         unique_together = [['library', 'name', 'type', 'source']]
@@ -296,6 +361,8 @@ class PhotoTag(UUIDModel, VersionedModel):
     # A place to store extra JSON data such as face feature positions for eyes, nose and mouth
     extra_data = models.TextField(null=True)
     deleted = models.BooleanField(default=False)
+
+    objects = PhotoRelatedForUserQuerySet.as_manager()
 
     class Meta:
         ordering = ['-significance']
@@ -333,16 +400,30 @@ class Task(UUIDModel, VersionedModel):
     def __str__(self):
         return '{}: {}'.format(self.type, self.created_at)
 
-    def start(self):
-        self.status = 'S'
-        self.started_at = timezone.now()
-        self.save()
+    def claim(self):
+        """Atomically claim a Pending task for processing.
+
+        Uses a conditional UPDATE so that when several processor replicas
+        fetch the same Pending task, only one of them wins the claim and
+        the others skip it. Returns True if this caller claimed the task.
+        """
+        now = timezone.now()
+        claimed = Task.objects.filter(pk=self.pk, status='P').update(
+            status='S', started_at=now, updated_at=now)
+        if claimed:
+            self.refresh_from_db()
+        return bool(claimed)
 
     def complete(self, next_type=None, next_subject_id=None):
-        # Set status of current task and queue up next task if appropriate
-        self.status = 'C'
-        self.finished_at = timezone.now()
-        self.save()
+        # Atomically transition to Completed. If another process completed
+        # this task already, do nothing - otherwise concurrent completions
+        # would each create their own downstream task chain.
+        now = timezone.now()
+        updated = Task.objects.filter(pk=self.pk).exclude(status='C').update(
+            status='C', finished_at=now, updated_at=now)
+        if not updated:
+            return
+        self.refresh_from_db()
 
         # Create next task in the chain if there should be one
         if not self.parent and next_type:
@@ -351,16 +432,21 @@ class Task(UUIDModel, VersionedModel):
         if self.parent and self.parent.complete_with_children:
             # If all siblings are complete, we should mark our parent as complete
             with transaction.atomic():
-                # select_for_update() will block if another process is working with these children
-                siblings = self.parent.children.select_for_update().filter(status='C')
-                if siblings.count() == self.parent.children.count():
-                    self.parent.complete(
+                # Lock the parent row so only one completing child at a time
+                # runs the all-siblings-complete check
+                parent = Task.objects.select_for_update().get(pk=self.parent_id)
+                if parent.status != 'C' and not parent.children.exclude(status='C').exists():
+                    parent.complete(
                         next_type=next_type, next_subject_id=next_subject_id)
 
     def failed(self, error=None, traceback=None):
-        self.status = 'F'
-        self.finished_at = timezone.now()
-        self.save()
+        # Atomically transition to Failed. Never clobber a concurrent
+        # completion - a task that already Completed stays Completed.
+        now = timezone.now()
+        updated = Task.objects.filter(pk=self.pk).exclude(status='C').update(
+            status='F', finished_at=now, updated_at=now)
+        if updated:
+            self.refresh_from_db()
 
         if error:
             logger.error(error)

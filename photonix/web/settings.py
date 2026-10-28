@@ -31,6 +31,11 @@ HTTPS = os.environ.get('HTTPS', 'true').lower() in ('1', 'true', 'yes')
 SESSION_COOKIE_SECURE = HTTPS
 CSRF_COOKIE_SECURE = HTTPS
 CSRF_FAILURE_VIEW = 'photonix.web.views.csrf_failure'
+# Behind a TLS-terminating proxy Django sees plain HTTP, so browser Origin
+# headers (https://...) must be trusted explicitly, e.g.
+# CSRF_TRUSTED_ORIGINS=https://photos.example.com
+CSRF_TRUSTED_ORIGINS = [
+    o for o in os.environ.get('CSRF_TRUSTED_ORIGINS', '').split(',') if o]
 
 # Application definition
 
@@ -193,7 +198,7 @@ THUMBNAIL_SIZES = [
     (256, 256, 'cover', 50, True, True),  # Square thumbnails
     # We use the largest dimension for both dimensions as they won't crop and some with in portrait mode
     # (960, 960, 'contain', 75, False, False),  # 960px
-    # (1920, 1920, 'contain', 75, False, False),  # 2k
+    (1920, 1920, 'contain', 75, False, False),  # 2k
     (3840, 3840, 'contain', 75, False, False),  # 4k
 ]
 

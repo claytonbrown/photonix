@@ -1,0 +1,231 @@
+import { useState, useCallback, useRef, useEffect } from 'react'
+import { useMutation, useApolloClient } from '@apollo/client/react'
+import { useNavigate } from '@tanstack/react-router'
+import { PhotoToolbar } from './PhotoToolbar'
+import { PhotoCarousel, useCarouselNavigation } from './PhotoCarousel'
+import { NavigationArrows } from './NavigationArrows'
+import { PhotoInfoSidebar } from './PhotoInfoSidebar'
+import { FullscreenButton } from './FullscreenButton'
+import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts'
+import { useImageRotation } from './hooks/useImageRotation'
+import { useCurrentPhotoData } from './hooks/useCurrentPhotoData'
+import { useOptimalResolution } from './hooks/useOptimalResolution'
+import { usePhotoListStore } from '../../lib/photos/photo-list-store'
+import { UPDATE_PHOTO_RATING } from '../../lib/photos/graphql'
+import { SET_PHOTOS_DELETED } from '../../lib/photos/batch-graphql'
+import { addToast } from '../../lib/ui/store'
+import type { PhotoDetail } from '../../lib/photos/detail-types'
+
+interface PhotoDetailViewProps {
+  photo: PhotoDetail
+}
+
+export function PhotoDetailView({ photo }: PhotoDetailViewProps) {
+  const navigate = useNavigate()
+  const carouselRef = useRef<HTMLDivElement>(null)
+  const resolution = useOptimalResolution()
+
+
+  const [showInfo, setShowInfo] = useState(false)
+  const [showToolbar, setShowToolbar] = useState(true)
+  const [showNavArrows, setShowNavArrows] = useState(false)
+  const [showPeopleBoxes, setShowPeopleBoxes] = useState(() => {
+    const stored = localStorage.getItem('showPeopleBoxes')
+    return stored !== null ? stored === 'true' : true
+  })
+  const [showObjectBoxes, setShowObjectBoxes] = useState(() => {
+    const stored = localStorage.getItem('showObjectBoxes')
+    return stored !== null ? stored === 'true' : true
+  })
+  const [localRating, setLocalRating] = useState(photo.starRating)
+
+  // Track current photo for carousel (may differ from URL during swipe)
+  const [currentPhotoId, setCurrentPhotoId] = useState(photo.id)
+
+  // Fetch metadata for the current carousel photo (for sidebar and bounding boxes)
+  const { photo: currentPhoto, refetch: refetchCurrentPhoto } = useCurrentPhotoData(currentPhotoId, photo)
+
+  // Update localRating when navigating to a different photo
+  useEffect(() => {
+    setLocalRating(currentPhoto.starRating)
+  }, [currentPhoto.id, currentPhoto.starRating])
+
+  // Refetch any mounted filter facets so the Rating range reflects the change.
+  const [updateRating] = useMutation(UPDATE_PHOTO_RATING, {
+    refetchQueries: ['FilterFacets'],
+  })
+
+  const { hasPrev, hasNext, rotationsByPhotoId, updateRotation } = usePhotoListStore()
+
+  // Carousel navigation (smooth scrolling)
+  const { scrollToPrev, scrollToNext } = useCarouselNavigation(carouselRef)
+
+  // Callback to update rotation in the store when user rotates
+  const handleRotationChange = useCallback((newRotation: number) => {
+    updateRotation(photo.id, newRotation)
+  }, [photo.id, updateRotation])
+
+  const {
+    totalRotation,
+    rotateClockwise,
+    rotateCounterClockwise,
+  } = useImageRotation({
+    photoFileId: photo.baseFileId,
+    initialRotation: photo.rotation,
+    initialUserRotation: photo.userRotation,
+    onRotationChange: handleRotationChange,
+  })
+
+  const goToHome = useCallback(() => {
+    navigate({ to: '/' })
+  }, [navigate])
+
+  // Soft-delete the current photo, then return to the grid. The grid's Photos
+  // query is only refetchable once it's mounted again, so refetch after the
+  // navigation completes.
+  const [setPhotosDeleted] = useMutation(SET_PHOTOS_DELETED)
+  const client = useApolloClient()
+  const handleDelete = useCallback(async () => {
+    if (!window.confirm('Delete this photo?')) return
+    try {
+      const result = await setPhotosDeleted({
+        variables: { photoIds: currentPhoto.id },
+      })
+      if (result.data?.setPhotosDeleted.ok) {
+        addToast('Photo deleted', 'success')
+        await navigate({ to: '/' })
+        void client.refetchQueries({ include: ['Photos'] })
+      } else {
+        addToast("Couldn't delete photo")
+      }
+    } catch {
+      addToast("Couldn't delete photo")
+    }
+  }, [currentPhoto.id, setPhotosDeleted, navigate, client])
+
+  const toggleInfo = useCallback(() => {
+    setShowInfo((prev) => !prev)
+  }, [])
+
+  const togglePeopleBoxes = useCallback(() => {
+    setShowPeopleBoxes((prev) => {
+      const newValue = !prev
+      localStorage.setItem('showPeopleBoxes', String(newValue))
+      return newValue
+    })
+  }, [])
+
+  const toggleObjectBoxes = useCallback(() => {
+    setShowObjectBoxes((prev) => {
+      const newValue = !prev
+      localStorage.setItem('showObjectBoxes', String(newValue))
+      return newValue
+    })
+  }, [])
+
+  const handleViewerClick = useCallback(() => {
+    if (showInfo) {
+      setShowInfo(false)
+    } else {
+      setShowToolbar((prev) => !prev)
+    }
+  }, [showInfo])
+
+  const handleRatingChange = useCallback(
+    (newRating: number) => {
+      setLocalRating(newRating)
+      updateRating({
+        variables: { photoId: currentPhoto.id, starRating: newRating },
+      }).catch(() => {
+        setLocalRating(currentPhoto.starRating)
+        addToast("Couldn't save rating")
+      })
+    },
+    [currentPhoto.id, currentPhoto.starRating, updateRating]
+  )
+
+  // Handle photo change from carousel (swipe or scroll)
+  // Update URL so refreshing shows the correct photo, but the route component
+  // is smart enough to not refetch when the photo is in the carousel
+  const handlePhotoChange = useCallback((newPhotoId: string) => {
+    setCurrentPhotoId(newPhotoId)
+    // Update URL in browser history - the route component will detect this is a
+    // carousel navigation and skip refetching
+    window.history.replaceState(null, '', `/photo/${newPhotoId}`)
+  }, [])
+
+  // Keyboard shortcuts - use carousel scroll for prev/next
+  useKeyboardShortcuts({
+    onEscape: goToHome,
+    onPrev: scrollToPrev,
+    onNext: scrollToNext,
+    onTogglePeopleBoxes: togglePeopleBoxes,
+    onToggleObjectBoxes: toggleObjectBoxes,
+    onToggleInfo: toggleInfo,
+  })
+
+  return (
+    <div
+      className="fixed inset-0 bg-[#1d1d1d] flex"
+      onMouseMove={() => setShowNavArrows(true)}
+      onMouseLeave={() => setShowNavArrows(false)}
+    >
+      {/* Toolbar - z-50 to appear above sidebar (z-40) */}
+      {showToolbar && (
+        <PhotoToolbar
+          onBack={goToHome}
+          onRotateCW={rotateClockwise}
+          onRotateCCW={rotateCounterClockwise}
+          downloadUrl={photo.downloadUrl}
+          showInfo={showInfo}
+          onToggleInfo={toggleInfo}
+          onDelete={handleDelete}
+        />
+      )}
+
+      {/* Main photo area - z-30 keeps it below sidebar (z-40) */}
+      <div className="flex-1 relative overflow-hidden z-30">
+        {/* Photo carousel with swipe support */}
+        <PhotoCarousel
+          ref={carouselRef}
+          currentPhotoId={currentPhotoId}
+          rotation={totalRotation}
+          rotationsByPhotoId={rotationsByPhotoId}
+          onPhotoChange={handlePhotoChange}
+          onClick={handleViewerClick}
+          personTags={currentPhoto.personTags}
+          objectTags={currentPhoto.objectTags}
+          showPeopleBoxes={showPeopleBoxes}
+          showObjectBoxes={showObjectBoxes}
+          tagsPhotoId={currentPhoto.id}
+          onRefetch={refetchCurrentPhoto}
+        />
+
+        {/* Navigation arrows */}
+        <NavigationArrows
+          onPrev={scrollToPrev}
+          onNext={scrollToNext}
+          hasPrev={hasPrev()}
+          hasNext={hasNext()}
+          visible={showNavArrows || showToolbar}
+        />
+
+        {/* Fullscreen button */}
+        <FullscreenButton />
+      </div>
+
+      {/* Info sidebar */}
+      <PhotoInfoSidebar
+        photo={{ ...currentPhoto, starRating: localRating }}
+        show={showInfo}
+        showPeopleBoxes={showPeopleBoxes}
+        showObjectBoxes={showObjectBoxes}
+        onTogglePeopleBoxes={togglePeopleBoxes}
+        onToggleObjectBoxes={toggleObjectBoxes}
+        onRatingChange={handleRatingChange}
+        onTagsUpdated={refetchCurrentPhoto}
+        resolution={resolution}
+      />
+    </div>
+  )
+}

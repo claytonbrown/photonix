@@ -10,20 +10,36 @@ services:
   postgres:
     container_name: photonix-postgres
     image: postgres:18-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres']
+      interval: 10s
+      timeout: 5s
+      retries: 5
     environment:
       POSTGRES_DB: photonix
       POSTGRES_PASSWORD: password
     volumes:
-      - ./data/db:/var/lib/postgresql/data
+      # Postgres 18 images moved PGDATA below /var/lib/postgresql - mounting
+      # the old /var/lib/postgresql/data path would leave the real database
+      # inside the container and lose it on recreate
+      - ./data/db:/var/lib/postgresql
 
   redis:
     container_name: photonix-redis
     image: redis:8-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   photonix:
     user: "2000:2000"
     container_name: photonix
     image: photonixapp/photonix:latest
+    restart: unless-stopped
     ports:
       - '8888:80'
     environment:
@@ -34,6 +50,8 @@ services:
       POSTGRES_PASSWORD: password
       REDIS_HOST: redis
       ALLOWED_HOSTS: '*'
+      # Public URL(s) when served over HTTPS behind a proxy, comma-separated
+      # CSRF_TRUSTED_ORIGINS: https://photos.example.com
       # More configuration options here: https://photonix.org/docs/configuration/
     volumes:
       - ./data/photos:/data/photos

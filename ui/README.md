@@ -1,44 +1,69 @@
-This project was bootstrapped with [Create React App](https://github.com/facebook/create-react-app).
+# Photonix UI
 
-## Available Scripts
+React frontend for [Photonix](https://photonix.org), built with Vite, React 19,
+TypeScript, Tailwind CSS 4, TanStack Router, Apollo Client and Zustand.
 
-In the project directory, you can run:
+## Development
 
-### `npm start`
+There are two ways to run the UI during development. Both need the Docker dev
+stack running first (`make start` from the repo root), which provides the
+Django/GraphQL backend, nginx, Postgres and Redis.
 
-Runs the app in the development mode.<br>
-Open [http://localhost:3000](http://localhost:3000) to view it in the browser.
+### 1. Inside the container (default)
 
-The page will reload if you make edits.<br>
-You will also see any lint errors in the console.
+`make start` runs a Vite dev server inside the `photonix` container
+(supervisord program `vite`) and serves everything through nginx at
+**http://localhost:8888**. Source files are bind-mounted, so edits on the host
+hot-reload in the browser. No host-side setup is needed.
 
-### `npm test`
+### 2. On the host
 
-Launches the test runner in the interactive watch mode.<br>
-See the section about [running tests](https://facebook.github.io/create-react-app/docs/running-tests) for more information.
+For faster tooling (editor integration, quicker restarts) you can run Vite on
+the host against the container backend:
 
-### `npm run build`
+```sh
+cd ui
+npm install
+npm run dev            # serves on http://localhost:3000
+```
 
-Builds the app for production to the `build` folder.<br>
-It correctly bundles React in production mode and optimizes the build for the best performance.
+`vite.config.ts` proxies `/graphql`, `/thumbnailer`, `/thumbnails`,
+`/download` and `/photos` to the container nginx (default
+`http://localhost:8888`, override with the `PHOTONIX_BACKEND` env var). The
+proxy also rewrites the `Origin`/`Referer` headers so Django's CSRF origin
+check passes when the app is served from a different port.
 
-The build is minified and the filenames include the hashes.<br>
-Your app is ready to be deployed!
+## Scripts
 
-See the section about [deployment](https://facebook.github.io/create-react-app/docs/deployment) for more information.
+| Command                | What it does                                     |
+| ---------------------- | ------------------------------------------------ |
+| `npm run dev`          | Vite dev server on :3000                         |
+| `npm run build`        | Typecheck (`tsc -b`) + production build          |
+| `npm run lint`         | ESLint over the whole package                    |
+| `npm run test:e2e`     | Playwright end-to-end suite                      |
+| `npm run test:e2e:ui`  | Playwright suite in interactive UI mode          |
 
-### `npm run eject`
+Equivalent repo-root Makefile targets: `make lint-ui`, `make build-ui`,
+`make e2e` (alias `make test-ui`).
 
-**Note: this is a one-way operation. Once you `eject`, you can’t go back!**
+## End-to-end tests
 
-If you aren’t satisfied with the build tool and configuration choices, you can `eject` at any time. This command will remove the single build dependency from your project.
+The Playwright specs in `e2e/` run against the real dev stack at
+`http://localhost:8888` — start it with `make start` before running them.
 
-Instead, it will copy all the configuration files and the transitive dependencies (Webpack, Babel, ESLint, etc) right into your project so you have full control over them. All of the commands except `eject` will still work, but they will point to the copied scripts so you can tweak them. At this point you’re on your own.
+- Specs seed and clean up their own users/photos by piping Python into
+  `manage.py shell` in the container (see `e2e/test-utils.ts`).
+- Image fixtures (`/data/photos/test_<colour>.jpg`, `checkerboard.jpg`) are
+  generated inside the container by `e2e/global-setup.ts` on the first run —
+  no manual setup required.
+- Tests share one database and run serially (`workers: 1`).
 
-You don’t have to ever use `eject`. The curated feature set is suitable for small and middle deployments, and you shouldn’t feel obligated to use this feature. However we understand that this tool wouldn’t be useful if you couldn’t customize it when you are ready for it.
+```sh
+cd ui
+npx playwright install chromium   # first time only
+npm run test:e2e
+```
 
-## Learn More
-
-You can learn more in the [Create React App documentation](https://facebook.github.io/create-react-app/docs/getting-started).
-
-To learn React, check out the [React documentation](https://reactjs.org/).
+In CI the suite runs in the `test-e2e` job of
+`.github/workflows/docker-build.yml`, which boots the compose stack with
+`docker/docker-compose.ci.yml` overrides (no demo-photo downloads).
