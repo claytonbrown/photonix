@@ -53,6 +53,8 @@ services:
       POSTGRES_PASSWORD: password
       REDIS_HOST: redis
       ALLOWED_HOSTS: '*'
+      # Public URL(s) when served over HTTPS behind a proxy, comma-separated
+      # CSRF_TRUSTED_ORIGINS: https://photos.example.com
     volumes:
       - ../data/photos:/data/photos
       - ../data/raw-photos-processed:/data/raw-photos-processed

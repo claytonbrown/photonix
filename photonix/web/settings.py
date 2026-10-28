@@ -31,6 +31,11 @@ HTTPS = os.environ.get('HTTPS', 'true').lower() in ('1', 'true', 'yes')
 SESSION_COOKIE_SECURE = HTTPS
 CSRF_COOKIE_SECURE = HTTPS
 CSRF_FAILURE_VIEW = 'photonix.web.views.csrf_failure'
+# Behind a TLS-terminating proxy Django sees plain HTTP, so browser Origin
+# headers (https://...) must be trusted explicitly, e.g.
+# CSRF_TRUSTED_ORIGINS=https://photos.example.com
+CSRF_TRUSTED_ORIGINS = [
+    o for o in os.environ.get('CSRF_TRUSTED_ORIGINS', '').split(',') if o]
 
 # Application definition
 
